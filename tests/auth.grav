@@ -4,7 +4,7 @@
 import "std"
 import "std/net"
 import "../src/all.grav"
-import "../../apogee-routing/src/all.grav"
+import "apogee-routing"
 use apogee.*
 
 @Model class User implements Authenticatable {
