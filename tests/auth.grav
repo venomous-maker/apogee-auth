@@ -1,0 +1,190 @@
+// apogee-auth's tests: password hashing, the session guard (login, attempt,
+// logout, session regeneration, remember-me), the token and Basic guards,
+// the auth/guest/can middleware on real routes, and the gate with policies.
+import "std"
+import "std/net"
+import "../src/all.grav"
+import "../../apogee-routing/src/all.grav"
+use apogee.*
+
+@Model class User implements Authenticatable {
+    public id: long  public email: string  public password: string  public role: string  public remember: string = ""
+    constructor(id: long, email: string, password: string, role: string) { self.id = id; self.email = email; self.password = Passwords.make(password); self.role = role }
+    fn authId() -> string { return "${self.id}" }
+    fn authPassword() -> string { return self.password }
+    fn rememberToken() -> string { return self.remember }
+    fn setRememberToken(t: string) { self.remember = t }
+}
+@Model class Post { public id: long  public authorId: long  constructor(id: long, authorId: long) { self.id = id; self.authorId = authorId } }
+
+class PostPolicy extends Policy {
+    constructor() {}
+    fn before(user: any, ability: string) -> bool? { return user != null && (user as User).role == "admin" ? true : null }
+    fn update(user: User, post: Post) -> bool { return user.id == post.authorId }
+    fn delete(user: User, post: Post) -> Decision { return user.id == post.authorId ? Decision.allow() : Decision.deny("You do not own this post.") }
+    @Guests fn view(user: User, post: Post) -> bool { return true }        // guests too
+    fn create(user: User) -> bool { return user.role == "editor" }
+}
+
+fn users() -> MemoryUserProvider {
+    Passwords.iterations = 1000                                           // (fast for tests)
+    let list = new Array<any>()
+    list.push(new User(1, "ada@x.io", "secret1", "editor"))
+    list.push(new User(2, "bob@x.io", "secret2", "reader"))
+    list.push(new User(3, "root@x.io", "secret3", "admin"))
+    return new MemoryUserProvider(list)
+}
+fn withSession(req: Request, store: MemorySessionStore) -> Request {
+    req.session = new SessionManager(store, "k").sessionFor(req)
+    return req
+}
+
+test "passwords: hashed, salted, checked, rehashed when the cost changes" {
+    Passwords.iterations = 1000
+    let h = Passwords.make("correct horse")
+    assertEq("${Passwords.check("correct horse", h)} ${Passwords.check("wrong", h)} ${Passwords.isHashed(h)}", "true false true")
+    assertEq(Passwords.make("correct horse") != h, true)                 // a fresh salt each time
+    assertEq(Passwords.needsRehash(h), false)
+    Passwords.iterations = 2000
+    assertEq(Passwords.needsRehash(h), true)
+    assertEq(Passwords.check("correct horse", h), true)                  // old hashes still check
+    assertEq(Passwords.check("x", "plain-text"), false)
+}
+
+test "the session guard: attempt, login (new session id), logout, once" {
+    let store = new MemorySessionStore()
+    let g = new SessionGuard("web", users(), new CookieJar("k"))
+    let req = withSession(Request.make("POST", "/login"), store)
+    let before = (req.session as Session).id
+    assertEq(g.attempt(req, {"email": "ada@x.io", "password": "nope"}), false)
+    assertEq(g.attempt(req, {"email": "ada@x.io", "password": "secret1"}), true)
+    let s = req.session as Session
+    assertEq("${s.id != before} ${g.id(req)} ${(g.user(req) as User).email}", "true 1 ada@x.io")
+    s.save(60)
+    let next = Request.make("GET", "/")
+    next.session = new Session(store, s.id).start()
+    assertEq(g.check(next), true)                                          // the next request knows her
+    g.logout(next)
+    assertEq("${g.check(next)} ${next.user == null}", "false true")
+    let once = withSession(Request.make("GET", "/"), store)
+    g.once(once, users().retrieveById("2"))
+    assertEq(g.id(once), "2")
+    assertEq(g.validate({"email": "bob@x.io", "password": "secret2"}), true)
+}
+
+test "remember me: a new session finds the user by the signed cookie, until logout" {
+    let store = new MemorySessionStore()
+    let provider = users()
+    let jar = new CookieJar("k")
+    let g = new SessionGuard("web", provider, jar)
+    let req = withSession(Request.make("POST", "/login"), store)
+    g.attempt(req, {"email": "ada@x.io", "password": "secret1"}, true)
+    let cookie = req.get("auth.queuedCookie") as Cookie
+    assertEq(cookie.name, "remember_web")
+    let fresh = Request.make("GET", "/")                                   // a new browser session
+    fresh.http.headers.set("Cookie", "remember_web=" + cookie.value)
+    withSession(fresh, new MemorySessionStore())
+    assertEq("${g.id(fresh)} ${g.viaRememberCookie(fresh)}", "1 true")
+    g.logout(fresh)                                                        // rotates the token
+    let again = Request.make("GET", "/")
+    again.http.headers.set("Cookie", "remember_web=" + cookie.value)
+    withSession(again, new MemorySessionStore())
+    assertEq(g.check(again), false)
+}
+
+test "token and Basic guards" {
+    let provider = users()
+    let token = provider.issueApiToken(provider.retrieveById("2"))
+    let api = new TokenGuard("api", provider)
+    let r = Request.make("GET", "/api/me")
+    r.http.headers.set("Authorization", "Bearer " + token)
+    assertEq(api.id(r), "2")
+    let bad = Request.make("GET", "/api/me")
+    bad.http.headers.set("Authorization", "Bearer nope")
+    assertEq(api.check(bad), false)
+    let basic = new BasicGuard("basic", provider)
+    let b = Request.make("GET", "/admin")
+    b.http.headers.set("Authorization", "Basic " + Base64.encode("root@x.io:secret3"))
+    assertEq(basic.id(b), "3")
+}
+
+fn app() -> HttpKernel {
+    let provider = users()
+    let gate = new Gate()
+    gate.policy::<Post, PostPolicy>()
+    gate.define("see-reports", fn(user: any, args: Array<any>) -> any { return (user as User).role == "admin" })
+    let auth = new AuthManager(gate)
+    auth.addGuard(new SessionGuard("web", provider, new CookieJar("k")))
+    let api = new TokenGuard("api", provider)
+    auth.addGuard(api)
+    let r = new Router(new Container())
+    r.aliasInstance("session", new StartSession(new SessionManager(new MemorySessionStore(), "k")))
+    r.aliasMiddleware("auth", fn(a: Array<string>) -> Middleware { return new Authenticate(auth, a) })
+    r.aliasInstance("guest", new RedirectIfAuthenticated(auth, "/home"))
+    r.aliasMiddleware("can", fn(a: Array<string>) -> Middleware { return new Authorize(auth, a) })
+    r.bind("post", fn(id: string, req: Request) -> any { return new Post(Integer.parseOr(id, 0), id == "10" ? 1 : 2) })
+    r.middleware(["session"]).group(fn(r: Router) {
+        r.post("/login", fn(req: Request) -> Response {
+            return auth.session().attempt(req, {"email": req.string("email"), "password": req.string("password")}) ? Response.redirect("/home") : Response.text("no", 422)
+        }).middleware(["guest"])
+        r.get("/home", fn(req: Request) -> Response { return Response.text("hi " + (req.user as User).email) }).middleware(["auth"])
+        r.put("/posts/{post}", fn(req: Request) -> Response { return Response.text("updated") }).middleware(["auth", "can:update,post"])
+        r.get("/reports", fn(req: Request) -> Response { return Response.text("reports") }).middleware(["auth", "can:see-reports"])
+    })
+    r.get("/api/me", fn(req: Request) -> Response { return Response.json({"id": (req.user as User).id}) }).middleware(["auth:api"])
+    return new HttpKernel(r)
+}
+fn browse(k: HttpKernel, jar: HashMap<string, string>, method: string, path: string, body: string = "", json: bool = false) -> Response {
+    let req = Request.make(method, path, body, body == "" ? "" : "application/x-www-form-urlencoded")
+    if (json) { req.http.headers.set("Accept", "application/json") }
+    let parts = new Array<string>()
+    jar.forEach(fn(n: string, v: string) { parts.push(n + "=" + v) })
+    if (parts.size() > 0) { req.http.headers.set("Cookie", Str.join(parts, "; ")) }
+    let res = k.handleRequest(req)
+    for (c in res.http.cookies()) { jar.put(c.name, c.value) }
+    return res
+}
+
+test "middleware: auth redirects or 401s, guest bounces, can authorizes" {
+    let k = app()
+    let jar = new HashMap<string, string>()
+    assertEq(browse(k, jar, "GET", "/home").getHeader("Location"), "/login")
+    assertEq(browse(k, jar, "GET", "/home", "", true).statusCode(), 401)
+    assertEq(browse(k, jar, "POST", "/login", "email=ada%40x.io&password=secret1").getHeader("Location"), "/home")
+    assertEq(browse(k, jar, "GET", "/home").body(), "hi ada@x.io")
+    assertEq(browse(k, jar, "POST", "/login", "email=ada%40x.io&password=secret1").getHeader("Location"), "/home")   // guest-only
+    assertEq(browse(k, jar, "PUT", "/posts/10").body(), "updated")         // her own post
+    let theirs = browse(k, jar, "PUT", "/posts/11", "", true)
+    assertEq("${theirs.statusCode()} ${theirs.body()}", "403 {\"message\":\"This action is unauthorized.\"}")
+    assertEq(browse(k, jar, "GET", "/reports").statusCode(), 403)
+    let p = users()
+    let token = p.issueApiToken(p.retrieveById("1"))
+    let req = Request.make("GET", "/api/me")
+    req.http.headers.set("Authorization", "Bearer " + token)
+    req.http.headers.set("Accept", "application/json")
+    assertEq(k.handleRequest(req).statusCode(), 401)                       // a token from another provider instance
+}
+
+test "the gate: policies, before hooks, guests, decisions, abilities, discovery" {
+    let p = users()
+    let ada = p.retrieveById("1")
+    let bob = p.retrieveById("2")
+    let root = p.retrieveById("3")
+    let gate = new Gate()
+    gate.policy::<Post, PostPolicy>()
+    let hers = new Post(10, 1)
+    assertEq("${gate.allows(ada, "update", [hers as any])} ${gate.allows(bob, "update", [hers as any])} ${gate.allows(root, "update", [hers as any])}", "true false true")
+    assertEq(gate.inspect(bob, "delete", [hers as any]).message, "You do not own this post.")
+    assertEq("${gate.allows(null, "view", [hers as any])} ${gate.allows(null, "update", [hers as any])}", "true false")
+    assertEq("${gate.allows(ada, "create", ["Post" as any])} ${gate.allows(bob, "create", ["Post" as any])}", "true false")
+    gate.define("export", fn(u: any, a: Array<any>) -> any { return Decision.denyAsNotFound() })
+    let status = 0
+    try { gate.authorize(ada, "export") } catch (e: AuthorizationException) { status = e.status }
+    assertEq(status, 404)
+    gate.after(fn(u: any, ability: string, allowed: bool) -> bool? { return ability == "export" ? true : null })
+    assertEq(gate.allows(ada, "export"), true)
+    assertEq(gate.denies(ada, "unknown-ability"), true)
+    assertEq(gate.forUser(bob).allows("view", [hers as any]), true)
+    let found = new Gate()
+    assertEq("${found.discoverPolicies() >= 1} ${found.hasPolicy("Post")}", "true true")
+}
