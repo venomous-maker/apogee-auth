@@ -1,0 +1,9 @@
+name = "apogee-auth"
+lib = "src/all.grav"
+paths = ["src"]
+
+[dependencies]
+apogee-container = { path = "../apogee-container" }
+apogee-http = { path = "../apogee-http" }
+apogee-session = { path = "../apogee-session" }
+grav-redis = { path = "../grav-redis" }
