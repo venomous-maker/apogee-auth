@@ -1,0 +1,106 @@
+// auth.grav — AuthManager (the guards by name, the default one) and the
+// middleware: "auth" (a user is required), "guest" (none may be), and "can"
+// (an ability through the gate).
+//
+//   let auth = new AuthManager(gate)
+//   auth.addGuard(new SessionGuard("web", users, jar))
+//   auth.addGuard(new TokenGuard("api", users))
+//   router.aliasMiddleware("auth", fn(a: Array<string>) -> Middleware { return new Authenticate(auth, a) })    // "auth:api"
+//   router.aliasInstance("guest", new RedirectIfAuthenticated(auth, "/home"))
+//   router.aliasMiddleware("can", fn(a: Array<string>) -> Middleware { return new Authorize(auth, a) })        // "can:update,post"
+import "std"
+import "std/net"
+import "apogee-http"
+import "guards.grav"
+import "gate.grav"
+
+namespace apogee {
+
+    class AuthManager {
+        public gate: Gate
+        public defaultGuard: string = "web"
+        // Where "auth" sends a guest who wants HTML ("" for a 401).
+        public loginUrl: string = "/login"
+        private guards: HashMap<string, Guard>
+        constructor(gate: Gate) { self.gate = gate; self.guards = new HashMap<string, Guard>(); }
+        fn addGuard(g: Guard) -> AuthManager { self.guards.put(g.name(), g); return self; }
+        fn guard(name: string = "") -> Guard {
+            let n = name == "" ? self.defaultGuard : name;
+            let g = self.guards.getOr(n, null);
+            if (g == null) { throw new StateError("no guard called '" + n + "'"); }
+            return g;
+        }
+        fn session(name: string = "") -> SessionGuard {
+            let g = self.guard(name);
+            if (!(g is SessionGuard)) { throw new StateError("the " + g.name() + " guard does not keep sessions"); }
+            return g as SessionGuard;
+        }
+        fn user(req: Request) -> any { return self.guard().user(req); }
+        fn check(req: Request) -> bool { return self.guard().check(req); }
+        fn id(req: Request) -> string { return self.guard().id(req); }
+        // The request's user's view of the gate.
+        fn can(req: Request, ability: string, args: Array<any> = new Array<any>()) -> bool { return self.gate.allows(self.user(req), ability, args); }
+        fn authorize(req: Request, ability: string, args: Array<any> = new Array<any>()) -> Decision { return self.gate.authorize(self.user(req), ability, args); }
+        // Puts a guard's queued cookie (remember-me, or its removal) on the response.
+        static fn attachCookies(req: Request, res: Response) -> Response {
+            let c = req.get("auth.queuedCookie");
+            if (c is Cookie) { res.withCookie(c as Cookie); }
+            return res;
+        }
+    }
+
+    // "auth" / "auth:api,web": the first guard with a user lets the request
+    // through; with none, a 401 for JSON clients, else a redirect to the login page.
+    class Authenticate implements Middleware {
+        private auth: AuthManager
+        private names: Array<string>
+        constructor(auth: AuthManager, names: Array<string> = new Array<string>()) { self.auth = auth; self.names = names; }
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            let tried = self.names.size() == 0 ? [self.auth.defaultGuard] as Array<string> : self.names;
+            for (n in tried) {
+                if (self.auth.guard(n).user(req) != null) { return AuthManager.attachCookies(req, next(req)); }
+            }
+            if (req.expectsJson() || self.auth.loginUrl == "") { throw new HttpException(401, "Unauthenticated."); }
+            if (req.session is OldInputStore && req.method() == "GET") {
+                // (where to come back to after signing in)
+                if (req.session is FlashStore) { (req.session as FlashStore).flash("url.intended", req.fullUrl()); }
+            }
+            return Response.redirect(self.auth.loginUrl);
+        }
+    }
+
+    // "guest": a signed-in user is sent elsewhere (away from the login page).
+    class RedirectIfAuthenticated implements Middleware {
+        private auth: AuthManager
+        private home: string
+        constructor(auth: AuthManager, home: string = "/") { self.auth = auth; self.home = home; }
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            if (self.auth.check(req)) { return req.expectsJson() ? Response.json({"message": "Already signed in."}, 409) : Response.redirect(self.home); }
+            return AuthManager.attachCookies(req, next(req));
+        }
+    }
+
+    // "can:update,post": the gate decides; the arguments after the ability are
+    // route parameters (their bound models) or class names ("can:create,app.Post").
+    class Authorize implements Middleware {
+        private auth: AuthManager
+        private ability: string
+        private params: Array<string>
+        constructor(auth: AuthManager, args: Array<string>) {
+            if (args.size() == 0) { throw new ValueError("can: needs an ability, as in can:update,post"); }
+            self.auth = auth;
+            self.ability = args[0];
+            self.params = new Array<string>();
+            for (i in 1..args.size()) { self.params.push(args[i]); }
+        }
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            let args = new Array<any>();
+            for (p in self.params) {
+                let bound = req.get(p);
+                args.push(bound != null ? bound : (req.http.param(p) != "" ? req.http.param(p) as any : p as any));
+            }
+            self.auth.authorize(req, self.ability, args);
+            return next(req);
+        }
+    }
+}
