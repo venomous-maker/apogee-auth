@@ -1,0 +1,34 @@
+// hasher.grav — password hashing: PBKDF2-HMAC-SHA256 with a random salt,
+// stored with its parameters, checked in constant time.
+//
+//   let hash = Passwords.make("correct horse")       // "$pbkdf2-sha256$600000$<salt>$<key>"
+//   Passwords.check("correct horse", hash)           // true
+//   Passwords.needsRehash(hash)                       // true once the iterations were raised
+import "std"
+
+namespace apogee {
+
+    class Passwords {
+        // Iterations for new hashes (OWASP's 2023 figure for PBKDF2-SHA256).
+        public static iterations: long = 600000
+        static fn make(password: string) -> string {
+            let salt = Hash.randomToken(16);
+            let key = Hash.pbkdf2Sha256(password, salt, Passwords.iterations, 32);
+            return "$pbkdf2-sha256$${Passwords.iterations}$" + salt + "$" + key;
+        }
+        static fn check(password: string, hash: string) -> bool {
+            let parts = Str.split(hash, "$");
+            if (parts.size() != 5 || parts[1] != "pbkdf2-sha256") { return false; }
+            let n = Integer.parseOr(parts[2], 0);
+            if (n < 1 || parts[4].length != 64) { return false; }
+            return Hash.equals(Hash.pbkdf2Sha256(password, parts[3], n, 32), parts[4]);
+        }
+        // Whether `hash` was made with other parameters than today's (make a new one at the next sign-in).
+        static fn needsRehash(hash: string) -> bool {
+            let parts = Str.split(hash, "$");
+            return parts.size() != 5 || parts[1] != "pbkdf2-sha256" || Integer.parseOr(parts[2], 0) != Passwords.iterations;
+        }
+        // Whether a stored value looks like one of these hashes (not a plain password by mistake).
+        static fn isHashed(value: string) -> bool { return Str.startsWith(value, "$pbkdf2-sha256$") && Str.split(value, "$").size() == 5; }
+    }
+}
