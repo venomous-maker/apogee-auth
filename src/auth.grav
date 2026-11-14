@@ -35,9 +35,10 @@ namespace apogee {
             if (!(g is SessionGuard)) { throw new StateError("the " + g.name() + " guard does not keep sessions"); }
             return g as SessionGuard;
         }
-        fn user(req: Request) -> any { return self.guard().user(req); }
-        fn check(req: Request) -> bool { return self.guard().check(req); }
-        fn id(req: Request) -> string { return self.guard().id(req); }
+        // The request's user: the one a guard already found (auth:api …), else the default guard's.
+        fn user(req: Request) -> any { return req.user != null ? req.user : self.guard().user(req); }
+        fn check(req: Request) -> bool { return self.user(req) != null; }
+        fn id(req: Request) -> string { let u = self.user(req); return u == null ? "" : (u as Authenticatable).authId(); }
         // The request's user's view of the gate.
         fn can(req: Request, ability: string, args: Array<any> = new Array<any>()) -> bool { return self.gate.allows(self.user(req), ability, args); }
         fn authorize(req: Request, ability: string, args: Array<any> = new Array<any>()) -> Decision { return self.gate.authorize(self.user(req), ability, args); }

@@ -116,6 +116,8 @@ namespace apogee {
 
         fn user(req: Request) -> any {
             if (req.user != null && req.get("auth.guard") == self.guardName as any) { return req.user; }
+            // (a request without a session, an API call say, has no signed-in user here)
+            if (!(req.session is Session)) { return null; }
             let s = self.session(req);
             let id = s.string(self.sessionKey());
             let u: any = null;

@@ -108,8 +108,10 @@ test "token and Basic guards" {
     assertEq(basic.id(b), "3")
 }
 
+class AppUsers { static provider: MemoryUserProvider = null }
 fn app() -> HttpKernel {
     let provider = users()
+    AppUsers.provider = provider
     let gate = new Gate()
     gate.policy::<Post, PostPolicy>()
     gate.define("see-reports", fn(user: any, args: Array<any>) -> any { return (user as User).role == "admin" })
@@ -132,6 +134,7 @@ fn app() -> HttpKernel {
         r.get("/reports", fn(req: Request) -> Response { return Response.text("reports") }).middleware(["auth", "can:see-reports"])
     })
     r.get("/api/me", fn(req: Request) -> Response { return Response.json({"id": (req.user as User).id}) }).middleware(["auth:api"])
+    r.get("/api/reports", fn(req: Request) -> Response { return Response.text("api reports") }).middleware(["auth:api", "can:see-reports"])
     return new HttpKernel(r)
 }
 fn browse(k: HttpKernel, jar: HashMap<string, string>, method: string, path: string, body: string = "", json: bool = false) -> Response {
@@ -163,6 +166,11 @@ test "middleware: auth redirects or 401s, guest bounces, can authorizes" {
     req.http.headers.set("Authorization", "Bearer " + token)
     req.http.headers.set("Accept", "application/json")
     assertEq(k.handleRequest(req).statusCode(), 401)                       // a token from another provider instance
+    let mine = AppUsers.provider.issueApiToken(AppUsers.provider.retrieveById("3"))
+    let reports = Request.make("GET", "/api/reports")
+    reports.http.headers.set("Authorization", "Bearer " + mine)
+    reports.http.headers.set("Accept", "application/json")
+    assertEq(k.handleRequest(reports).body(), "api reports")                // can: sees the token's user (no session needed)
 }
 
 test "the gate: policies, before hooks, guests, decisions, abilities, discovery" {
