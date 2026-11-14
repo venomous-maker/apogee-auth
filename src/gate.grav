@@ -1,0 +1,174 @@
+// gate.grav — authorization: what a user may do. Abilities are closures;
+// policies group a model's abilities in a class (PostPolicy.update(user,
+// post)); before/after hooks see every check.
+//
+//   gate.define("publish", fn(user: any, args: Array<any>) -> bool { return (user as User).isEditor() })
+//   gate.policy::<Post, PostPolicy>()                  // or gate.discoverPolicies()
+//   gate.before(fn(user: any, ability: string) -> bool? { return (user as User).isAdmin() ? true : null })
+//   gate.allows(user, "update", [post])
+//   gate.authorize(user, "delete", [post])             // AuthorizationException (403) when not
+import "std"
+import "apogee-http"
+
+namespace apogee {
+
+    // A decision with a reason: Decision.allow(), Decision.deny("You do not own this post."),
+    // Decision.denyAsNotFound() (a 404: do not even reveal it exists).
+    class Decision {
+        public allowed: bool
+        public message: string
+        public status: int
+        constructor(allowed: bool, message: string, status: int) { self.allowed = allowed; self.message = message; self.status = status; }
+        static fn allow() -> Decision { return new Decision(true, "", 200); }
+        static fn deny(message: string = "This action is unauthorized.") -> Decision { return new Decision(false, message, 403); }
+        static fn denyWithStatus(status: int, message: string = "") -> Decision { return new Decision(false, message, status); }
+        static fn denyAsNotFound() -> Decision { return new Decision(false, "Not Found", 404); }
+    }
+
+    // What authorize() throws: renders as its status (403, or the decision's).
+    class AuthorizationException extends HttpException {
+        public ability: string
+        constructor(ability: string, d: Decision) { super(d.status, d.message == "" ? "This action is unauthorized." : d.message); self.ability = ability; }
+        public fn kind() -> string { return "AuthorizationException"; }
+    }
+
+    // The base class for policies: its decorator gives every policy reflection
+    // (methods called by ability name, and discoverPolicies()).
+    @Policy abstract class Policy {
+        // Runs before any of the policy's abilities: true/false decides, null goes on.
+        fn before(user: any, ability: string) -> bool? { return null; }
+    }
+
+    class Gate {
+        private abilities: HashMap<string, fn(any, Array<any>) -> any>
+        private guestAbilities: HashSet<string>
+        // Model class name -> its policy.
+        private policies: HashMap<string, Policy>
+        private befores: Array<fn(any, string) -> bool?>
+        private afters: Array<fn(any, string, bool) -> bool?>
+
+        constructor() {
+            self.abilities = new HashMap<string, fn(any, Array<any>) -> any>();
+            self.guestAbilities = new HashSet<string>();
+            self.policies = new HashMap<string, Policy>();
+            self.befores = new Array<fn(any, string) -> bool?>();
+            self.afters = new Array<fn(any, string, bool) -> bool?>();
+        }
+
+        // ── defining ───────────────────────────────────────────────────────────
+        // `check` returns a bool or a Decision; guests are denied unless `guests`.
+        fn define(ability: string, check: fn(any, Array<any>) -> any, guests: bool = false) -> Gate {
+            self.abilities.put(ability, check);
+            if (guests) { self.guestAbilities.add(ability); }
+            return self;
+        }
+        // P's methods decide M's abilities: gate.allows(user, "update", [post]) calls P.update(user, post).
+        fn policy<M, P>() -> Gate { self.policies.put(nameof(M), reflect(P).create() as Policy); return self; }
+        fn policyFor(modelClass: string, p: Policy) -> Gate { self.policies.put(modelClass, p); return self; }
+        // Every concrete Policy subclass named <Model>Policy, for the class <Model>
+        // in the same namespace (app.PostPolicy -> app.Post); how many.
+        fn discoverPolicies() -> int {
+            let n = 0;
+            for (cls in ClassInfo.all(reflect(Policy))) {
+                if (!cls.canCreate() || !Str.endsWith(cls.name, "Policy") || cls.name == nameof(Policy)) { continue; }
+                let model = cls.name[..cls.name.length - 6];
+                if (model == "" || Str.endsWith(model, ".")) { continue; }
+                self.policies.put(model, cls.create() as Policy);
+                n += 1;
+            }
+            return n;
+        }
+        fn hasPolicy(modelClass: string) -> bool { return self.policies.containsKey(modelClass); }
+        // Runs before every check: true/false decides it, null leaves it to the ability.
+        fn before(f: fn(any, string) -> bool?) -> Gate { self.befores.push(f); return self; }
+        // Runs after: may change the outcome (true/false), or leave it (null).
+        fn after(f: fn(any, string, bool) -> bool?) -> Gate { self.afters.push(f); return self; }
+        fn has(ability: string) -> bool { return self.abilities.containsKey(ability); }
+
+        // ── checking ───────────────────────────────────────────────────────────
+        fn allows(user: any, ability: string, args: Array<any> = new Array<any>()) -> bool { return self.inspect(user, ability, args).allowed; }
+        fn denies(user: any, ability: string, args: Array<any> = new Array<any>()) -> bool { return !self.allows(user, ability, args); }
+        // Whether `user` may do every one (any one) of the abilities.
+        fn check(user: any, abilities: Array<string>, args: Array<any> = new Array<any>()) -> bool {
+            for (a in abilities) { if (!self.allows(user, a, args)) { return false; } }
+            return true;
+        }
+        fn any(user: any, abilities: Array<string>, args: Array<any> = new Array<any>()) -> bool {
+            for (a in abilities) { if (self.allows(user, a, args)) { return true; } }
+            return false;
+        }
+        fn authorize(user: any, ability: string, args: Array<any> = new Array<any>()) -> Decision {
+            let d = self.inspect(user, ability, args);
+            if (!d.allowed) { throw new AuthorizationException(ability, d); }
+            return d;
+        }
+        // The decision, with its message.
+        fn inspect(user: any, ability: string, args: Array<any> = new Array<any>()) -> Decision {
+            for (b in self.befores) {
+                let r = b(user, ability);
+                if (r != null) { return self.finish(user, ability, r ? Decision.allow() : Decision.deny()); }
+            }
+            let d = self.decide(user, ability, args);
+            return self.finish(user, ability, d);
+        }
+        private fn finish(user: any, ability: string, d: Decision) -> Decision {
+            let out = d;
+            for (a in self.afters) {
+                let r = a(user, ability, out.allowed);
+                if (r != null) { out = r ? Decision.allow() : Decision.deny(); }
+            }
+            return out;
+        }
+        private fn decide(user: any, ability: string, args: Array<any>) -> Decision {
+            // A policy, by the first argument's class (a model) or a class name given as text.
+            if (args.size() > 0) {
+                let p = self.policyOf(args[0]);
+                if (p != null) {
+                    let info = ClassInfo.of(p);
+                    let early = p.before(user, ability);
+                    if (early != null) { return early ? Decision.allow() : Decision.deny(); }
+                    let m = info.method(ability);
+                    if (m != null) {
+                        // (guests are denied unless the method is marked @Guests, or takes `any`)
+                        if (user == null && !m.has("Guests") && !Str.startsWith(m.params, "any")) { return Decision.deny(); }
+                        let callArgs = new Array<any>();
+                        callArgs.push(user);
+                        let rest = args[0] is string ? 1 : 0;           // gate.allows(user, "create", ["app.Post"]): no model to pass
+                        for (i in rest..args.size()) { callArgs.push(args[i]); }
+                        while (callArgs.size() > m.paramCount()) { callArgs.pop(); }
+                        return Gate.asDecision(m.invoke(p, callArgs));
+                    }
+                }
+            }
+            let f = self.abilities.getOr(ability, null);
+            if (f == null) { return Decision.deny(); }
+            if (user == null && !self.guestAbilities.contains(ability)) { return Decision.deny(); }
+            return Gate.asDecision(f(user, args));
+        }
+        private fn policyOf(target: any) -> Policy {
+            if (target is string) { return self.policies.getOr(target as string, null); }
+            let info = ClassInfo.of(target);
+            while (info != null) {
+                let p = self.policies.getOr(info.name, null);
+                if (p != null) { return p; }
+                info = info.base();
+            }
+            return null;
+        }
+        static fn asDecision(v: any) -> Decision {
+            if (v is Decision) { return v as Decision; }
+            return v is bool && v as bool ? Decision.allow() : Decision.deny();
+        }
+        // A view of the gate for one user.
+        fn forUser(user: any) -> UserGate { return new UserGate(self, user); }
+    }
+
+    class UserGate {
+        public gate: Gate
+        public user: any
+        constructor(gate: Gate, user: any) { self.gate = gate; self.user = user; }
+        fn allows(ability: string, args: Array<any> = new Array<any>()) -> bool { return self.gate.allows(self.user, ability, args); }
+        fn denies(ability: string, args: Array<any> = new Array<any>()) -> bool { return self.gate.denies(self.user, ability, args); }
+        fn authorize(ability: string, args: Array<any> = new Array<any>()) -> Decision { return self.gate.authorize(self.user, ability, args); }
+    }
+}
