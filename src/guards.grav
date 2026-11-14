@@ -1,0 +1,231 @@
+// guards.grav — who is making a request: users and where they come from
+// (UserProvider), and guards that find the user for a request: by session
+// (with remember-me), by bearer token, or by HTTP Basic credentials.
+//
+//   let web = new SessionGuard("web", provider, cookieJar)
+//   if (web.attempt(req, {"email": email, "password": password}, remember)) { ... }
+//   web.user(req)      web.check(req)      web.logout(req)
+import "std"
+import "std/net"
+import "apogee-http"
+import "apogee-session"
+import "hasher.grav"
+
+namespace apogee {
+
+    // A user a guard can sign in.
+    interface Authenticatable {
+        // The user's id, as text.
+        fn authId() -> string
+        // The stored password hash.
+        fn authPassword() -> string
+        // The remember-me token ("" for none).
+        fn rememberToken() -> string { return ""; }
+        fn setRememberToken(token: string) {}
+    }
+
+    // Where users come from (a table through Orbit, a directory, a file).
+    interface UserProvider {
+        fn retrieveById(id: string) -> any
+        // The user the credentials point at, without checking the password
+        // (every key but "password" is a field to match).
+        fn retrieveByCredentials(credentials: HashMap<string, any>) -> any
+        fn validateCredentials(user: any, credentials: HashMap<string, any>) -> bool
+        // The user with this id and remember-me token (null when either does not match).
+        fn retrieveByToken(id: string, token: string) -> any
+        fn updateRememberToken(user: any, token: string)
+        // The user an API token (its SHA-256, as stored) belongs to.
+        fn retrieveByApiToken(tokenHash: string) -> any { return null; }
+    }
+
+    // Users kept in memory: tests, single-user tools, prototypes.
+    class MemoryUserProvider implements UserProvider {
+        public users: Array<any>
+        // The field credentials are matched on, by reflection ("email").
+        public loginField: string
+        // API token hashes -> user ids.
+        public apiTokens: HashMap<string, string>
+        constructor(users: Array<any>, loginField: string = "email") { self.users = users; self.loginField = loginField; self.apiTokens = new HashMap<string, string>(); }
+        fn retrieveById(id: string) -> any {
+            for (u in self.users) { if ((u as Authenticatable).authId() == id) { return u; } }
+            return null;
+        }
+        fn retrieveByCredentials(credentials: HashMap<string, any>) -> any {
+            for (u in self.users) {
+                let ok = true;
+                let info = ClassInfo.of(u);
+                for (k in credentials.keys()) {
+                    if (k == "password") { continue; }
+                    let f = info.field(k);
+                    if (f == null || str(f.get(u)) != str(credentials[k])) { ok = false; }
+                }
+                if (ok) { return u; }
+            }
+            return null;
+        }
+        fn validateCredentials(user: any, credentials: HashMap<string, any>) -> bool {
+            let pw = credentials.getOr("password", null);
+            return pw != null && Passwords.check(str(pw), (user as Authenticatable).authPassword());
+        }
+        fn retrieveByToken(id: string, token: string) -> any {
+            let u = self.retrieveById(id);
+            if (u == null) { return null; }
+            let mine = (u as Authenticatable).rememberToken();
+            return mine != "" && Hash.equals(mine, token) ? u : null;
+        }
+        fn updateRememberToken(user: any, token: string) { (user as Authenticatable).setRememberToken(token); }
+        fn retrieveByApiToken(tokenHash: string) -> any {
+            let id = self.apiTokens.getOr(tokenHash, "");
+            return id == "" ? null : self.retrieveById(id);
+        }
+        // Issues an API token for `user`: the plain token, shown once (only its hash is kept).
+        fn issueApiToken(user: any) -> string {
+            let token = Hash.randomToken(32);
+            self.apiTokens.put(Hash.sha256(token), (user as Authenticatable).authId());
+            return token;
+        }
+    }
+
+    // Finds the user of a request.
+    interface Guard {
+        fn name() -> string
+        // The user (null for a guest); found once per request and kept on it.
+        fn user(req: Request) -> any
+        fn check(req: Request) -> bool { return self.user(req) != null; }
+        fn guest(req: Request) -> bool { return self.user(req) == null; }
+        fn id(req: Request) -> string { let u = self.user(req); return u == null ? "" : (u as Authenticatable).authId(); }
+        // Whether the credentials are right (signing nobody in).
+        fn validate(credentials: HashMap<string, any>) -> bool
+    }
+
+    // A signed-in user kept in the session; "remember me" keeps them across
+    // sessions through a signed cookie holding their id and remember token.
+    class SessionGuard implements Guard {
+        public provider: UserProvider
+        public rememberMinutes: int = 60 * 24 * 400
+        private guardName: string
+        private jar: CookieJar
+        constructor(name: string, provider: UserProvider, jar: CookieJar) { self.guardName = name; self.provider = provider; self.jar = jar; }
+        fn name() -> string { return self.guardName; }
+        private fn sessionKey() -> string { return "login_" + self.guardName; }
+        private fn cookieName() -> string { return "remember_" + self.guardName; }
+        private fn session(req: Request) -> Session {
+            if (!(req.session is Session)) { throw new StateError("the " + self.guardName + " guard needs a session: put StartSession first"); }
+            return req.session as Session;
+        }
+
+        fn user(req: Request) -> any {
+            if (req.user != null && req.get("auth.guard") == self.guardName as any) { return req.user; }
+            let s = self.session(req);
+            let id = s.string(self.sessionKey());
+            let u: any = null;
+            if (id != "") { u = self.provider.retrieveById(id); }
+            if (u == null) { u = self.viaRemember(req); }
+            if (u != null) { self.setUser(req, u); }
+            return u;
+        }
+        // Whether the request's user came back through the remember-me cookie.
+        fn viaRememberCookie(req: Request) -> bool { return req.get("auth.viaRemember") == true as any; }
+        private fn viaRemember(req: Request) -> any {
+            let raw = self.jar.read(req, self.cookieName());
+            let bar = Str.indexOf(raw, "|");
+            if (bar <= 0) { return null; }
+            let u = self.provider.retrieveByToken(raw[..bar], raw[bar + 1..]);
+            if (u != null) {
+                self.session(req).put(self.sessionKey(), (u as Authenticatable).authId());
+                self.session(req).regenerate();
+                req.set("auth.viaRemember", true);
+            }
+            return u;
+        }
+        private fn setUser(req: Request, u: any) { req.user = u; req.set("auth.guard", self.guardName); }
+
+        fn validate(credentials: HashMap<string, any>) -> bool {
+            let u = self.provider.retrieveByCredentials(credentials);
+            return u != null && self.provider.validateCredentials(u, credentials);
+        }
+        // Signs in the user the credentials match; whether they did.
+        fn attempt(req: Request, credentials: HashMap<string, any>, remember: bool = false) -> bool {
+            let u = self.provider.retrieveByCredentials(credentials);
+            if (u == null || !self.provider.validateCredentials(u, credentials)) { return false; }
+            self.login(req, u, remember);
+            return true;
+        }
+        // Signs `user` in: a new session id (no fixation), and with `remember`
+        // a long-lived cookie (and a fresh remember token).
+        fn login(req: Request, user: any, remember: bool = false) {
+            let s = self.session(req);
+            s.regenerate();
+            s.put(self.sessionKey(), (user as Authenticatable).authId());
+            if (remember) {
+                let token = Hash.randomToken(30);
+                self.provider.updateRememberToken(user, token);
+                req.set("auth.queuedCookie", self.jar.make(self.cookieName(), (user as Authenticatable).authId() + "|" + token, self.rememberMinutes));
+            }
+            self.setUser(req, user);
+        }
+        fn loginUsingId(req: Request, id: string, remember: bool = false) -> any {
+            let u = self.provider.retrieveById(id);
+            if (u != null) { self.login(req, u, remember); }
+            return u;
+        }
+        // Signs `user` in for this request only (no session).
+        fn once(req: Request, user: any) { self.setUser(req, user); }
+        // Signs out: the session emptied with a new id, the remember token rotated, the cookie removed.
+        fn logout(req: Request) {
+            let u = self.user(req);
+            if (u != null) { self.provider.updateRememberToken(u, Hash.randomToken(30)); }
+            self.session(req).invalidate();
+            req.user = null;
+            req.set("auth.queuedCookie", self.jar.forget(self.cookieName()));
+        }
+    }
+
+    // A bearer token (Authorization: Bearer <token>) looked up by its SHA-256:
+    // stolen hashes cannot be replayed.
+    class TokenGuard implements Guard {
+        public provider: UserProvider
+        private guardName: string
+        constructor(name: string, provider: UserProvider) { self.guardName = name; self.provider = provider; }
+        fn name() -> string { return self.guardName; }
+        fn user(req: Request) -> any {
+            if (req.user != null && req.get("auth.guard") == self.guardName as any) { return req.user; }
+            let token = req.bearerToken();
+            if (token == "") { token = req.query("api_token"); }
+            if (token == "") { return null; }
+            let u = self.provider.retrieveByApiToken(Hash.sha256(token));
+            if (u != null) { req.user = u; req.set("auth.guard", self.guardName); }
+            return u;
+        }
+        fn validate(credentials: HashMap<string, any>) -> bool {
+            let t = credentials.getOr("api_token", null);
+            return t != null && self.provider.retrieveByApiToken(Hash.sha256(str(t))) != null;
+        }
+    }
+
+    // HTTP Basic credentials, checked on every request (for internal tools and APIs).
+    class BasicGuard implements Guard {
+        public provider: UserProvider
+        public field: string
+        private guardName: string
+        constructor(name: string, provider: UserProvider, field: string = "email") { self.guardName = name; self.provider = provider; self.field = field; }
+        fn name() -> string { return self.guardName; }
+        fn user(req: Request) -> any {
+            if (req.user != null && req.get("auth.guard") == self.guardName as any) { return req.user; }
+            let c = req.basicCredentials();
+            if (c.size() != 2) { return null; }
+            let creds = new HashMap<string, any>();
+            creds.put(self.field, c[0]);
+            creds.put("password", c[1]);
+            let u = self.provider.retrieveByCredentials(creds);
+            if (u == null || !self.provider.validateCredentials(u, creds)) { return null; }
+            req.user = u;
+            req.set("auth.guard", self.guardName);
+            return u;
+        }
+        fn validate(credentials: HashMap<string, any>) -> bool {
+            let u = self.provider.retrieveByCredentials(credentials);
+            return u != null && self.provider.validateCredentials(u, credentials);
+        }
+    }
+}
