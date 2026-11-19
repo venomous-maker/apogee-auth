@@ -54,10 +54,10 @@ namespace apogee {
             for (u in self.users) {
                 let ok = true;
                 let info = ClassInfo.of(u);
-                for (k in credentials.keys()) {
+                for ((k, want) in credentials) {
                     if (k == "password") { continue; }
                     let f = info.field(k);
-                    if (f == null || str(f.get(u)) != str(credentials[k])) { ok = false; }
+                    if (f == null || str(f.get(u)) != str(want)) { ok = false; }
                 }
                 if (ok) { return u; }
             }
