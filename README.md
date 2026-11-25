@@ -5,7 +5,7 @@ password hashing, guards that find a request's user (session with
 remember-me, bearer token, HTTP Basic), the `auth`/`guest`/`can`
 middleware, and a gate with abilities and policies.
 
-```grav
+```typescript
 import "std"
 import "apogee-auth"
 
@@ -66,7 +66,7 @@ tokens; the framework adds one for Orbit models.
 
 ## The gate
 
-```grav
+```typescript
 gate.define("see-reports", fn(user: any, args: Array<any>) -> any { return (user as User).isAdmin() })
 gate.policy::<Post, PostPolicy>()
 gate.before(fn(user: any, ability: string) -> bool? { return isSuperAdmin(user) ? true : null })
