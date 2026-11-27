@@ -1,7 +1,7 @@
 # grav.lock: exact commits of the installed dependencies (generated; commit this file)
 apogee-container = { source = "github.com/venomous-maker/apogee-container", version = "v0.2.0", commit = "f027cc66880e602a500174bf3f28fe6d943f727a" }
 apogee-http = { source = "github.com/venomous-maker/apogee-http", version = "v0.3.0", commit = "c094f1debc4ca1f71343f77ed80174e06ac47254" }
-apogee-session = { source = "github.com/venomous-maker/apogee-session", version = "v0.2.2", commit = "d24a66f38a6283fe19b341e0d9ea55451e00b865" }
+apogee-session = { source = "github.com/venomous-maker/apogee-session", version = "v0.2.3", commit = "f02805f69a17959c2732cb5568802eab44d50ccc" }
 apogee-validation = { source = "github.com/venomous-maker/apogee-validation", version = "v0.2.1", commit = "cc32e20f5bbffeb1c02774923c2217be1644e3a7" }
 apogee-routing = { source = "github.com/venomous-maker/apogee-routing", version = "v0.3.0", commit = "e88127e9b666c317d39d6b26ce01ae0f61bf602c" }
-grav-redis = { source = "github.com/venomous-maker/grav-redis", version = "v0.2.1", commit = "f3dff2ec9efc3f53d2cd3c394fc412e4776244c3" }
+grav-redis = { source = "github.com/venomous-maker/grav-redis", version = "v0.2.2", commit = "d106c93e198e605d898833211723b70e6b80a8fb" }
